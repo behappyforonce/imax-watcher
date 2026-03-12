@@ -3,11 +3,9 @@ import sys
 import time
 import json
 import smtplib
-import requests
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
-from bs4 import BeautifulSoup
 
 # ── Config ─────────────────────────────────────────────────────────────────
 GMAIL_ADDRESS  = os.environ.get("GMAIL_ADDRESS")
@@ -31,7 +29,7 @@ WATCHLIST = [
 FORMAT_KEYWORDS = ["imax", "70mm", "plf", "prime", "laser", "large format"]
 SWEET_ROWS      = {"F","G","H","I","J","K","L"}
 SHOWTIME_STATE  = {}
-STATE_FILE      = "/tmp/imax_state.json"
+STATE_FILE      = os.path.expanduser("~/.imax_state.json")
 
 def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
@@ -54,101 +52,127 @@ def load_state():
 
 def get_imax_showtimes():
     results = []
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-        "Sec-Fetch-User": "?1",
-        "Cache-Control": "max-age=0",
-    }
-
-    # Try AMC's API with a session (more realistic browser behavior)
     try:
-        session = requests.Session()
-        session.headers.update(headers)
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        log("ERROR: Playwright not installed. Run: pip3 install playwright && python3 -m playwright install chromium")
+        return results
 
-        # First hit the homepage to get cookies
-        log("  Getting AMC cookies...")
-        session.get("https://www.amctheatres.com", timeout=15)
-
-        # Now try the API
-        url = "https://www.amctheatres.com/api/v2/theatres/1076/showtimes/views/current-and-upcoming"
-        log(f"  Fetching showtimes API...")
-        resp = session.get(url, timeout=15)
-        log(f"  HTTP {resp.status_code} — {len(resp.content)} bytes — {resp.headers.get('Content-Type','?')[:50]}")
-
-        if resp.status_code == 200 and "json" in resp.headers.get("Content-Type", ""):
-            data      = resp.json()
-            showtimes = data.get("_embedded", {}).get("showtimes", [])
-            log(f"  Got {len(showtimes)} showtimes from API")
-
-            for st in showtimes:
-                title     = st.get("movieName", "")
-                title_low = title.lower()
-                attrs     = " ".join(str(a) for a in st.get("attributeIds", [])).lower()
-                desc      = st.get("description", "").lower()
-                combined  = title_low + " " + attrs + " " + desc
-
-                is_watchlist = any(w in title_low for w in WATCHLIST)
-                is_large     = any(k in combined for k in FORMAT_KEYWORDS)
-
-                log(f"  '{title}' | large={is_large} | watchlist={is_watchlist} | attrs={attrs[:60]}")
-
-                if is_watchlist and is_large:
-                    results.append({
-                        "title":        title,
-                        "showtime":     st.get("showDateTimeLocal", ""),
-                        "showtime_id":  str(st.get("id", "")),
-                        "seats_avail":  st.get("seatsAvailable", 99),
-                        "total_seats":  st.get("totalSeats", 0),
-                        "purchase_url": f"https://www.amctheatres.com{st.get('purchaseUrl','')}",
-                    })
-                    log(f"  ✓ MATCH: {title}")
-
-            if results or showtimes:
-                return results
-
-        snippet = resp.text[:300]
-        log(f"  Response snippet: {snippet}")
-
-    except Exception as e:
-        log(f"  Session API error: {e}")
-
-    # Fallback: try Fandango with correct URL format
     try:
-        log("  Trying Fandango fallback...")
-        fandango_urls = [
-            "https://www.fandango.com/amc-lincoln-square-13-new-york-ny_aaanf/showtimes",
-            "https://www.fandango.com/theater-page/amc-lincoln-square-13-new-york_aaanf",
-        ]
-        for url in fandango_urls:
-            resp = requests.get(url, headers=headers, timeout=15)
-            log(f"  Fandango {url[-40:]} → HTTP {resp.status_code} — {len(resp.content)} bytes")
-            if resp.status_code == 200 and len(resp.content) > 5000:
-                soup = BeautifulSoup(resp.text, "html.parser")
-                # Log all text that contains our watchlist terms
+        with sync_playwright() as p:
+            log("  Launching browser...")
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+                viewport={"width": 1280, "height": 800},
+                locale="en-US",
+            )
+            page = context.new_page()
+
+            # Intercept the API response as the page loads
+            api_data = {}
+
+            def handle_response(response):
+                if "showtimes" in response.url and "amctheatres" in response.url:
+                    try:
+                        data = response.json()
+                        if "_embedded" in data or "showtimes" in data:
+                            api_data["showtimes"] = data
+                            log(f"  Intercepted API: {response.url[:80]}")
+                    except:
+                        pass
+
+            page.on("response", handle_response)
+
+            # Navigate to Lincoln Square showtimes page
+            url = "https://www.amctheatres.com/theatres/new-york/amc-lincoln-square-13/showtimes/all-movies/today/all-screenings"
+            log(f"  Navigating to AMC Lincoln Square...")
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            log("  Page loaded")
+
+            # If we intercepted API data, use it
+            if api_data.get("showtimes"):
+                data      = api_data["showtimes"]
+                showtimes = data.get("_embedded", {}).get("showtimes", []) or data.get("showtimes", [])
+                log(f"  Got {len(showtimes)} showtimes from intercepted API")
+
+                for st in showtimes:
+                    title     = st.get("movieName", "")
+                    title_low = title.lower()
+                    attrs     = " ".join(str(a) for a in st.get("attributeIds", [])).lower()
+                    desc      = st.get("description", "").lower()
+                    combined  = title_low + " " + attrs + " " + desc
+
+                    is_watchlist = any(w in title_low for w in WATCHLIST)
+                    is_large     = any(k in combined for k in FORMAT_KEYWORDS)
+
+                    if is_watchlist:
+                        log(f"  '{title}' | large={is_large} | attrs='{attrs[:60]}'")
+
+                    if is_watchlist and is_large:
+                        results.append({
+                            "title":        title,
+                            "showtime":     st.get("showDateTimeLocal", ""),
+                            "showtime_id":  str(st.get("id", "")),
+                            "seats_avail":  st.get("seatsAvailable", 99),
+                            "total_seats":  st.get("totalSeats", 0),
+                            "purchase_url": f"https://www.amctheatres.com{st.get('purchaseUrl','')}",
+                        })
+                        log(f"  ✓ MATCH: {title}")
+
+            else:
+                # Fall back to parsing the rendered page HTML
+                log("  No API intercept — parsing rendered page...")
+                content = page.content()
+
+                # Look for movie titles in the rendered HTML
+                from bs4 import BeautifulSoup
+                soup      = BeautifulSoup(content, "html.parser")
                 page_text = soup.get_text().lower()
-                for w in WATCHLIST[:4]:
+
+                for w in WATCHLIST:
                     if w in page_text:
-                        log(f"  Fandango has '{w}' on page ✓")
-                break
+                        log(f"  Page contains '{w}' ✓")
+
+                # Try to find showtime data in page source (often embedded as JSON)
+                import re
+                json_matches = re.findall(r'window\.__INITIAL_STATE__\s*=\s*({.+?});', content)
+                if not json_matches:
+                    json_matches = re.findall(r'"showtimes"\s*:\s*(\[.+?\])', content[:50000])
+
+                if json_matches:
+                    log(f"  Found embedded JSON data")
+                    try:
+                        embedded = json.loads(json_matches[0])
+                        log(f"  Embedded data keys: {list(embedded.keys())[:5] if isinstance(embedded, dict) else 'array'}")
+                    except:
+                        pass
+                else:
+                    log("  No embedded JSON found — page may need JavaScript to render")
+                    # Log a snippet to see what we got
+                    log(f"  Page snippet: {content[500:800]}")
+
+            browser.close()
 
     except Exception as e:
-        log(f"  Fandango error: {e}")
+        log(f"  Playwright error: {e}")
+        import traceback
+        traceback.print_exc()
 
     return results
 
 def check_sweet_spot(purchase_url):
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
-        resp    = requests.get(purchase_url, headers=headers, timeout=15)
-        soup    = BeautifulSoup(resp.text, "html.parser")
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page    = browser.new_page()
+            page.goto(purchase_url, wait_until="networkidle", timeout=30000)
+            content = page.content()
+            browser.close()
+
+        from bs4 import BeautifulSoup
+        soup         = BeautifulSoup(content, "html.parser")
         all_seats    = soup.find_all(attrs={"data-row": True})
         total_cap    = len(all_seats)
         sweet_by_row = {}
@@ -203,7 +227,6 @@ def send_alert(title, showtime_str, seat_info, purchase_url,
         status_label, pct_sold = fullness_label(seats_avail, total_seats)
         bar_w   = 24
         filled  = round(bar_w * pct_sold / 100)
-        bar_txt = "█" * filled + "░" * (bar_w - filled)
 
         if is_return:
             context = f"Previously sold out — {seats_avail} seats just opened up"
@@ -223,7 +246,7 @@ IMAX 70MM SEATS — {title.upper()}
 {show_display} · AMC Lincoln Square 13
 SEATS: {context}
 ZONE:  {seat_info}
-FILL:  {bar_txt} {pct_sold}% sold — {status_label}
+FILL:  {pct_sold}% sold — {status_label}
 → BOOK: {purchase_url}
 {"─"*42}
         """.strip()
@@ -270,7 +293,7 @@ FILL:  {bar_txt} {pct_sold}% sold — {status_label}
         return False
 
 def scan():
-    log("─── Scanning for IMAX 70MM at AMC Lincoln Square...")
+    log("─── Scanning AMC Lincoln Square for IMAX 70MM...")
     showtimes = get_imax_showtimes()
     if not showtimes:
         log("No matching IMAX 70MM showtimes found.")
