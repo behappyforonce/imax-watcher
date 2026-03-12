@@ -89,34 +89,89 @@ def get_imax_showtimes():
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
             log("  DOM loaded — dismissing cookie popup if present...")
 
-            # Dismiss cookie/consent popups
+            # Wait a moment for cookie popup to appear
+            page.wait_for_timeout(2000)
+
+            # Try every possible cookie dismiss approach
+            dismissed = False
+
+            # 1. Try Osano-specific buttons (AMC uses Osano)
             for selector in [
-                "button:has-text('Accept')",
-                "button:has-text('Accept All')",
-                "button:has-text('I Accept')",
-                "button:has-text('Agree')",
-                "[data-testid='cookie-accept']",
-                ".osano-cm-accept",
                 ".osano-cm-button--type_accept",
+                ".osano-cm-accept",
+                ".osano-cm-button[data-onetrust-accept-btn-handler]",
+                "button.osano-cm-button",
             ]:
                 try:
                     btn = page.locator(selector).first
-                    if btn.is_visible(timeout=2000):
+                    if btn.is_visible(timeout=1500):
                         btn.click()
-                        log(f"  Dismissed popup: {selector}")
+                        log(f"  Dismissed Osano popup: {selector}")
+                        dismissed = True
                         break
                 except:
                     pass
 
+            # 2. Try text-based button matching
+            if not dismissed:
+                for text in ["Accept All", "Accept", "I Accept", "Agree", "OK", "Got it", "Allow All", "Allow all cookies"]:
+                    try:
+                        btn = page.get_by_role("button", name=text, exact=False).first
+                        if btn.is_visible(timeout=1000):
+                            btn.click()
+                            log(f"  Dismissed popup by text: '{text}'")
+                            dismissed = True
+                            break
+                    except:
+                        pass
+
+            # 3. Nuclear option — JS click on any consent button
+            if not dismissed:
+                try:
+                    result = page.evaluate("""
+                        () => {
+                            const selectors = [
+                                '.osano-cm-button--type_accept',
+                                '.osano-cm-accept',
+                                '[class*="accept"]',
+                                '[class*="consent"] button',
+                                '[class*="cookie"] button',
+                                '[id*="accept"]',
+                            ];
+                            for (const sel of selectors) {
+                                const el = document.querySelector(sel);
+                                if (el) { el.click(); return sel; }
+                            }
+                            return null;
+                        }
+                    """)
+                    if result:
+                        log(f"  Dismissed via JS: {result}")
+                        dismissed = True
+                except:
+                    pass
+
+            if not dismissed:
+                log("  No cookie popup found (or already accepted)")
+
+            # Wait for cookie dismissal to take effect
+            page.wait_for_timeout(2000)
+
             # Wait for movie content to load
             log("  Waiting for showtime content...")
             try:
-                # Wait for actual showtime content — AMC renders movie titles in these elements
-                page.wait_for_selector("[class*='ShowtimesByMovie'], [class*='showtimes-by-movie'], [class*='MovieTitle'], [data-testid*='movie']", timeout=20000)
+                page.wait_for_selector("[class*='ShowtimesByMovie'], [class*='showtimes-by-movie'], [class*='MovieTitle'], [data-testid*='movie']", timeout=25000)
                 log("  Showtime content detected")
             except:
-                log("  Waiting 15s for JS to render showtimes...")
-                page.wait_for_timeout(15000)
+                log("  Selector timeout — waiting 20s more for JS...")
+                page.wait_for_timeout(20000)
+
+            # Debug: dump raw HTML to see what AMC is actually returning
+            raw_html = page.content()
+            log(f"  Raw HTML length: {len(raw_html)} chars")
+            if len(raw_html) < 5000:
+                # Page is suspiciously small — log more of it
+                log(f"  HTML snippet: {raw_html[:2000]}")
 
             # Take stock of what's on the page
             page_text = page.inner_text("body")
