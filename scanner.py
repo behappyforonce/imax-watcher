@@ -88,9 +88,15 @@ def get_imax_showtimes():
             url = "https://www.amctheatres.com/theatres/new-york/amc-lincoln-square-13/showtimes/all-movies/today/all-screenings"
             log(f"  Navigating to AMC Lincoln Square...")
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            # Wait a bit for JS to populate showtime data
-            page.wait_for_timeout(5000)
-            log("  Page loaded")
+            log("  Page loaded — waiting for showtime content...")
+            # Wait for showtime content to render (JS-driven)
+            try:
+                page.wait_for_selector("text=IMAX", timeout=15000)
+                log("  Showtime content detected")
+            except:
+                # If no IMAX text found, just wait a fixed amount
+                log("  No IMAX selector found, waiting 10s...")
+                page.wait_for_timeout(10000)
 
             # If we intercepted API data, use it
             if api_data.get("showtimes"):
@@ -150,9 +156,13 @@ def get_imax_showtimes():
                     except:
                         pass
                 else:
-                    log("  No embedded JSON found — page may need JavaScript to render")
-                    # Log a snippet to see what we got
-                    log(f"  Page snippet: {content[500:800]}")
+                    log("  No embedded JSON found — checking visible text...")
+                    page_text = soup.get_text(separator=" ", strip=True)
+                    for w in WATCHLIST[:5]:
+                        if w in page_text.lower():
+                            log(f"  Page contains '{w}' ✓")
+                    clean = " ".join(page_text.split())
+                    log(f"  Page text: {clean[100:500]}")
 
             browser.close()
 
