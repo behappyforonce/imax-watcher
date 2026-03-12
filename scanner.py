@@ -15,33 +15,22 @@ ALERT_EMAIL    = os.environ.get("ALERT_EMAIL")
 SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL", "900"))
 MIN_SEATS      = int(os.environ.get("MIN_SEATS", "2"))
 
-# ── Watchlist ───────────────────────────────────────────────────────────────
-# Add film titles here in lowercase. The scanner checks if any watchlist word
-# appears in the AMC listing title, so partial matches work fine.
 WATCHLIST = [
-    # ── Now playing ────────────────────────────────────────────────────
     "project hail mary",
-
-    # ── Re-releases (Oscar season 2026) ────────────────────────────────
+    "hail mary",
     "sinners",
     "one battle after another",
     "f1",
-
-    # ── Upcoming 2026 ──────────────────────────────────────────────────
-    "the odyssey",              # Nolan, July 17 2026 — shot entirely on IMAX 70mm
-    "dune: part three",        # December 2026
-    "dune part three",         # alternate title format AMC might use
-    "flowervale street",       # August 2026, tentative IMAX
-
-    # ── Unconfirmed title — update when announced ──────────────────────
-    # "lanthimos",             # Yorgos Lanthimos next film, shot on IMAX cameras
+    "the odyssey",
+    "dune: part three",
+    "dune part three",
+    "flowervale street",
 ]
 
-THEATER_ID = "1076"  # AMC Lincoln Square 13
-SWEET_ROWS = {"F","G","H","I","J","K","L"}
-
-# ── State: showtime_id -> {alerted, first_seen_seats, last_seen_seats, capacity, ever_sold_out}
-SHOWTIME_STATE = {}
+FORMAT_KEYWORDS = ["imax", "70mm", "plf", "prime", "laser"]
+THEATER_SLUG    = "new-york/amc-lincoln-square-13"
+SWEET_ROWS      = {"F","G","H","I","J","K","L"}
+SHOWTIME_STATE  = {}
 
 def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
@@ -63,65 +52,108 @@ def load_state():
         log("No previous state — starting fresh")
 
 def get_imax_showtimes():
-    headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
+    """Scrape AMC Lincoln Square showtimes page directly."""
     results = []
     try:
-        url  = f"https://www.amctheatres.com/api/v2/theatres/{THEATER_ID}/showtimes/views/current-and-upcoming?pageNumber=1&pageSize=100"
-        resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code != 200:
-            log(f"API {resp.status_code} — trying scrape fallback")
-            return scrape_fallback()
-        data = resp.json()
-        for movie in data.get("_embedded", {}).get("showtimes", []):
-            title = movie.get("movieName", "").lower()
-            fmt   = " ".join(str(x) for x in movie.get("attributeIds", []))
-            if "imax" not in fmt.lower() and "70mm" not in fmt.lower():
-                continue
-            if not any(w in title for w in WATCHLIST):
-                continue
-            results.append({
-                "title":        movie.get("movieName"),
-                "showtime":     movie.get("showDateTimeLocal", ""),
-                "showtime_id":  str(movie.get("id", "")),
-                "seats_avail":  movie.get("seatsAvailable", 0),
-                "total_seats":  movie.get("totalSeats", 0),
-                "purchase_url": f"https://www.amctheatres.com{movie.get('purchaseUrl', '')}",
-            })
-    except Exception as e:
-        log(f"API error: {e}")
-        return scrape_fallback()
-    return results
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+        }
+        url  = f"https://www.amctheatres.com/theatres/{THEATER_SLUG}/showtimes"
+        resp = requests.get(url, headers=headers, timeout=20)
+        log(f"  Scrape status: {resp.status_code} ({len(resp.text)} bytes)")
 
-def scrape_fallback():
-    results = []
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36"}
-        resp    = requests.get("https://www.amctheatres.com/theatres/new-york/amc-lincoln-square-13/showtimes", headers=headers, timeout=15)
-        soup    = BeautifulSoup(resp.text, "html.parser")
-        for section in soup.find_all(class_="ShowtimesByMovie"):
-            title_el = section.find(class_="MovieTitle")
-            if not title_el: continue
-            title = title_el.get_text(strip=True).lower()
-            if not any(w in title for w in WATCHLIST): continue
-            for st in section.find_all(class_="Showtime"):
-                fmt_el = st.find(class_="Format")
-                fmt    = fmt_el.get_text(strip=True).lower() if fmt_el else ""
-                if "imax" not in fmt and "70mm" not in fmt: continue
-                seats_el    = st.find(class_="SeatsAvailable")
-                avail       = int(seats_el.get_text(strip=True).split()[0]) if seats_el else 0
-                capacity_el = st.find(class_="TotalSeats")
+        soup = BeautifulSoup(resp.text, "html.parser")
+
+        # Log every movie title found on the page for debugging
+        all_titles = []
+        for el in soup.find_all(["h2","h3","h4"], class_=lambda c: c and "movie" in c.lower()):
+            all_titles.append(el.get_text(strip=True))
+        for el in soup.find_all(attrs={"data-moviewid": True}):
+            t = el.get("data-moviename") or el.get_text(strip=True)
+            if t: all_titles.append(t)
+
+        if all_titles:
+            log(f"  Movies found on page: {all_titles}")
+        else:
+            # Try broader search — log a snippet of the raw HTML to see what we're getting
+            log(f"  No movie titles found via standard selectors")
+            log(f"  Page snippet: {resp.text[500:1000]}")
+
+        # Try multiple selector strategies
+        movie_sections = (
+            soup.find_all(class_=lambda c: c and "ShowtimesByMovie" in str(c)) or
+            soup.find_all(attrs={"data-moviewid": True}) or
+            soup.find_all(class_=lambda c: c and "movie-showtimes" in str(c).lower())
+        )
+
+        log(f"  Found {len(movie_sections)} movie section(s)")
+
+        for section in movie_sections:
+            # Try to get title
+            title_el = (
+                section.find(class_=lambda c: c and "MovieTitle" in str(c)) or
+                section.find(class_=lambda c: c and "movie-title" in str(c).lower()) or
+                section.find(["h2","h3","h4"])
+            )
+            if not title_el:
+                continue
+            title     = title_el.get_text(strip=True)
+            title_low = title.lower()
+            log(f"  Checking movie: '{title}'")
+
+            on_watchlist = any(w in title_low for w in WATCHLIST)
+            if not on_watchlist:
+                continue
+
+            # Find all showtimes in this section
+            showtime_els = (
+                section.find_all(class_=lambda c: c and "Showtime" in str(c)) or
+                section.find_all(class_=lambda c: c and "showtime" in str(c).lower()) or
+                section.find_all("a", href=lambda h: h and "showtimes" in h)
+            )
+
+            for st in showtime_els:
+                # Check format
+                fmt_el = (
+                    st.find(class_=lambda c: c and "Format" in str(c)) or
+                    st.find(class_=lambda c: c and "format" in str(c).lower()) or
+                    st.find(class_=lambda c: c and "attribute" in str(c).lower())
+                )
+                fmt = fmt_el.get_text(strip=True).lower() if fmt_el else ""
+                # Also check the showtime element's own text and data attributes
+                st_text = st.get_text(strip=True).lower()
+                st_data = " ".join(str(v) for v in st.attrs.values()).lower()
+                combined = fmt + " " + st_text + " " + st_data
+
+                is_large = any(k in combined for k in FORMAT_KEYWORDS)
+                if not is_large:
+                    continue
+
+                seats_el    = st.find(class_=lambda c: c and ("Seat" in str(c) or "seat" in str(c).lower()))
+                avail       = int(seats_el.get_text(strip=True).split()[0]) if seats_el else 99
+                capacity_el = st.find(class_=lambda c: c and "Total" in str(c))
                 total       = int(capacity_el.get_text(strip=True).split()[0]) if capacity_el else 0
-                link_el     = st.find("a", href=True)
+                link_el     = st.find("a", href=True) or (st if st.name == "a" else None)
+                href        = link_el["href"] if link_el else ""
+                purchase_url = f"https://www.amctheatres.com{href}" if href.startswith("/") else href
+
+                showtime_id = st.get("data-id") or st.get("data-showtime-id") or href or f"{title}-{fmt}"
+
+                log(f"    ✓ MATCH: '{title}' | fmt='{fmt}' | avail={avail} | url={purchase_url[:60]}")
                 results.append({
-                    "title":        title_el.get_text(strip=True),
+                    "title":        title,
                     "showtime":     st.get("data-showtime", ""),
-                    "showtime_id":  st.get("data-id", ""),
+                    "showtime_id":  str(showtime_id),
                     "seats_avail":  avail,
                     "total_seats":  total,
-                    "purchase_url": f"https://www.amctheatres.com{link_el['href']}" if link_el else "",
+                    "purchase_url": purchase_url,
                 })
+
     except Exception as e:
-        log(f"Scrape fallback error: {e}")
+        log(f"Scrape error: {e}")
+
     return results
 
 def check_sweet_spot(purchase_url):
@@ -178,7 +210,7 @@ def send_alert(title, showtime_str, seat_info, purchase_url,
             dt           = datetime.fromisoformat(showtime_str)
             show_display = dt.strftime("%A %b %-d · %-I:%M %p")
         except:
-            show_display = showtime_str
+            show_display = showtime_str or "Showtime TBD"
 
         status_label, pct_sold = fullness_label(seats_avail, total_seats)
         bar_w   = 24
@@ -192,6 +224,11 @@ def send_alert(title, showtime_str, seat_info, purchase_url,
         else:
             context = f"{seats_avail} of {total_seats if total_seats else '?'} seats available"
 
+        if is_return:
+            ctx_color, ctx_text = "#7eb8a0", f"⟳ RETURN — {seats_avail} seats just opened"
+        else:
+            ctx_color, ctx_text = "#e8c547", context
+
         text = f"""
 IMAX 70MM SEATS — {title.upper()}
 {"─"*42}
@@ -199,20 +236,12 @@ IMAX 70MM SEATS — {title.upper()}
 
 SEATS:  {context}
 ZONE:   {seat_info}
-
-FILL:   {bar_txt} {pct_sold}% sold
-        {status_label}
+FILL:   {bar_txt} {pct_sold}% sold — {status_label}
 
 → BOOK: {purchase_url}
-
 {"─"*42}
 One-time alert. Won't re-notify unless show sells out then gets returns.
         """.strip()
-
-        if is_return:
-            ctx_color, ctx_text = "#7eb8a0", f"⟳ RETURN — {seats_avail} seats just opened"
-        else:
-            ctx_color, ctx_text = "#e8c547", context
 
         html = f"""
 <html><body style="font-family:monospace;background:#0a0a08;color:#e8e0cc;padding:32px;max-width:500px;margin:0 auto;">
@@ -259,7 +288,7 @@ def scan():
     log("─── Scanning AMC Lincoln Square for IMAX 70MM...")
     showtimes = get_imax_showtimes()
     if not showtimes:
-        log("No IMAX 70MM showtimes found on watchlist.")
+        log("No matching IMAX 70MM showtimes found on watchlist.")
         return
     log(f"Found {len(showtimes)} showtime(s) to evaluate.")
 
