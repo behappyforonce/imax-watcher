@@ -1,7 +1,6 @@
 [build]
-builder = "NIXPACKS"
+builder = "DOCKERFILE"
 
 [deploy]
-startCommand = "/opt/venv/bin/python scanner.py"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
