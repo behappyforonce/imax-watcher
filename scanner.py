@@ -55,7 +55,7 @@ def get_imax_showtimes():
     try:
         from playwright.sync_api import sync_playwright
     except ImportError:
-        log("ERROR: Playwright not installed. Run: pip3 install playwright && python3 -m playwright install chromium")
+        log("ERROR: Run: pip3 install playwright && python3 -m playwright install chromium")
         return results
 
     try:
@@ -69,54 +69,82 @@ def get_imax_showtimes():
             )
             page = context.new_page()
 
-            # Intercept the API response as the page loads
+            # Intercept API responses
             api_data = {}
-
             def handle_response(response):
-                if "showtimes" in response.url and "amctheatres" in response.url:
-                    try:
-                        data = response.json()
-                        if "_embedded" in data or "showtimes" in data:
-                            api_data["showtimes"] = data
-                            log(f"  Intercepted API: {response.url[:80]}")
-                    except:
-                        pass
-
+                try:
+                    if "amctheatres.com" in response.url and response.status == 200:
+                        ct = response.headers.get("content-type", "")
+                        if "json" in ct:
+                            data = response.json()
+                            if "_embedded" in data or "showtimes" in str(data)[:100]:
+                                api_data["data"] = data
+                                log(f"  ✓ Intercepted JSON: {response.url[-60:]}")
+                except:
+                    pass
             page.on("response", handle_response)
 
-            # Navigate to Lincoln Square showtimes page
             url = "https://www.amctheatres.com/theatres/new-york/amc-lincoln-square-13/showtimes/all-movies/today/all-screenings"
-            log(f"  Navigating to AMC Lincoln Square...")
+            log("  Navigating to AMC Lincoln Square...")
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            log("  Page loaded — waiting for showtime content...")
-            # Wait for showtime content to render (JS-driven)
+            log("  DOM loaded — dismissing cookie popup if present...")
+
+            # Dismiss cookie/consent popups
+            for selector in [
+                "button:has-text('Accept')",
+                "button:has-text('Accept All')",
+                "button:has-text('I Accept')",
+                "button:has-text('Agree')",
+                "[data-testid='cookie-accept']",
+                ".osano-cm-accept",
+                ".osano-cm-button--type_accept",
+            ]:
+                try:
+                    btn = page.locator(selector).first
+                    if btn.is_visible(timeout=2000):
+                        btn.click()
+                        log(f"  Dismissed popup: {selector}")
+                        break
+                except:
+                    pass
+
+            # Wait for movie content to load
+            log("  Waiting for showtime content...")
             try:
-                page.wait_for_selector("text=IMAX", timeout=15000)
-                log("  Showtime content detected")
+                page.wait_for_selector("[class*='MovieTitle'], [class*='movie-title'], h2, h3", timeout=15000)
+                log("  Content loaded")
             except:
-                # If no IMAX text found, just wait a fixed amount
-                log("  No IMAX selector found, waiting 10s...")
-                page.wait_for_timeout(10000)
+                log("  Selector timeout — waiting 8s for JS...")
+                page.wait_for_timeout(8000)
+
+            # Take stock of what's on the page
+            page_text = page.inner_text("body")
+            log(f"  Page text length: {len(page_text)} chars")
+
+            # Log watchlist matches
+            for w in WATCHLIST[:6]:
+                if w in page_text.lower():
+                    log(f"  ✓ Found on page: '{w}'")
+
+            # Log a clean snippet of actual text
+            lines = [l.strip() for l in page_text.split("\n") if l.strip() and len(l.strip()) > 3]
+            log(f"  First 10 lines: {lines[:10]}")
 
             # If we intercepted API data, use it
-            if api_data.get("showtimes"):
-                data      = api_data["showtimes"]
+            if api_data.get("data"):
+                data = api_data["data"]
                 showtimes = data.get("_embedded", {}).get("showtimes", []) or data.get("showtimes", [])
-                log(f"  Got {len(showtimes)} showtimes from intercepted API")
-
+                log(f"  Processing {len(showtimes)} showtimes from API")
                 for st in showtimes:
                     title     = st.get("movieName", "")
                     title_low = title.lower()
                     attrs     = " ".join(str(a) for a in st.get("attributeIds", [])).lower()
                     desc      = st.get("description", "").lower()
                     combined  = title_low + " " + attrs + " " + desc
-
                     is_watchlist = any(w in title_low for w in WATCHLIST)
                     is_large     = any(k in combined for k in FORMAT_KEYWORDS)
-
                     if is_watchlist:
-                        log(f"  '{title}' | large={is_large} | attrs='{attrs[:60]}'")
-
+                        log(f"  '{title}' large={is_large} attrs='{attrs[:60]}'")
                     if is_watchlist and is_large:
                         results.append({
                             "title":        title,
@@ -127,42 +155,25 @@ def get_imax_showtimes():
                             "purchase_url": f"https://www.amctheatres.com{st.get('purchaseUrl','')}",
                         })
                         log(f"  ✓ MATCH: {title}")
-
             else:
-                # Fall back to parsing the rendered page HTML
-                log("  No API intercept — parsing rendered page...")
-                content = page.content()
-
-                # Look for movie titles in the rendered HTML
-                from bs4 import BeautifulSoup
-                soup      = BeautifulSoup(content, "html.parser")
-                page_text = soup.get_text().lower()
-
+                log("  No API intercept — trying to parse page text directly...")
+                # Look for movie names in page text near IMAX/70mm
+                page_lower = page_text.lower()
                 for w in WATCHLIST:
-                    if w in page_text:
-                        log(f"  Page contains '{w}' ✓")
-
-                # Try to find showtime data in page source (often embedded as JSON)
-                import re
-                json_matches = re.findall(r'window\.__INITIAL_STATE__\s*=\s*({.+?});', content)
-                if not json_matches:
-                    json_matches = re.findall(r'"showtimes"\s*:\s*(\[.+?\])', content[:50000])
-
-                if json_matches:
-                    log(f"  Found embedded JSON data")
-                    try:
-                        embedded = json.loads(json_matches[0])
-                        log(f"  Embedded data keys: {list(embedded.keys())[:5] if isinstance(embedded, dict) else 'array'}")
-                    except:
-                        pass
-                else:
-                    log("  No embedded JSON found — checking visible text...")
-                    page_text = soup.get_text(separator=" ", strip=True)
-                    for w in WATCHLIST[:5]:
-                        if w in page_text.lower():
-                            log(f"  Page contains '{w}' ✓")
-                    clean = " ".join(page_text.split())
-                    log(f"  Page text: {clean[100:500]}")
+                    if w in page_lower:
+                        idx = page_lower.index(w)
+                        context_slice = page_lower[max(0,idx-100):idx+200]
+                        is_large = any(k in context_slice for k in FORMAT_KEYWORDS)
+                        log(f"  '{w}' found, nearby text: '{context_slice[:100]}', large={is_large}")
+                        if is_large:
+                            results.append({
+                                "title":        w.title(),
+                                "showtime":     "",
+                                "showtime_id":  w,
+                                "seats_avail":  99,
+                                "total_seats":  0,
+                                "purchase_url": url,
+                            })
 
             browser.close()
 
@@ -179,10 +190,10 @@ def check_sweet_spot(purchase_url):
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page    = browser.new_page()
-            page.goto(purchase_url, wait_until="networkidle", timeout=30000)
+            page.goto(purchase_url, wait_until="domcontentloaded", timeout=60000)
+            page.wait_for_timeout(5000)
             content = page.content()
             browser.close()
-
         from bs4 import BeautifulSoup
         soup         = BeautifulSoup(content, "html.parser")
         all_seats    = soup.find_all(attrs={"data-row": True})
@@ -190,7 +201,10 @@ def check_sweet_spot(purchase_url):
         sweet_by_row = {}
         for seat in soup.find_all(attrs={"data-row": True, "data-status": "available"}):
             row = seat.get("data-row", "").upper()
-            col = int(seat.get("data-column", 0))
+            try:
+                col = int(seat.get("data-column", 0))
+            except:
+                continue
             if row in SWEET_ROWS and col > 2:
                 sweet_by_row.setdefault(row, []).append(col)
         good_rows = []
@@ -237,8 +251,8 @@ def send_alert(title, showtime_str, seat_info, purchase_url,
             show_display = showtime_str or "See link for showtime"
 
         status_label, pct_sold = fullness_label(seats_avail, total_seats)
-        bar_w   = 24
-        filled  = round(bar_w * pct_sold / 100)
+        bar_w  = 24
+        filled = round(bar_w * pct_sold / 100)
 
         if is_return:
             context = f"Previously sold out — {seats_avail} seats just opened up"
@@ -247,10 +261,8 @@ def send_alert(title, showtime_str, seat_info, purchase_url,
         else:
             context = f"{seats_avail} of {total_seats if total_seats else '?'} seats available"
 
-        if is_return:
-            ctx_color, ctx_text = "#7eb8a0", f"⟳ RETURN — {seats_avail} seats just opened"
-        else:
-            ctx_color, ctx_text = "#e8c547", context
+        ctx_color = "#7eb8a0" if is_return else "#e8c547"
+        ctx_text  = f"⟳ RETURN — {seats_avail} seats just opened" if is_return else context
 
         text = f"""
 IMAX 70MM SEATS — {title.upper()}
@@ -310,77 +322,51 @@ def scan():
     if not showtimes:
         log("No matching IMAX 70MM showtimes found.")
         return
-
     log(f"Found {len(showtimes)} showtime(s) to evaluate.")
     for show in showtimes:
         sid   = show["showtime_id"]
         avail = show["seats_avail"]
         total = show["total_seats"]
-
         state = SHOWTIME_STATE.get(sid, {
-            "alerted":          False,
-            "first_seen_seats": avail,
-            "last_seen_seats":  avail,
-            "capacity":         total,
-            "ever_sold_out":    False,
+            "alerted": False, "first_seen_seats": avail,
+            "last_seen_seats": avail, "capacity": total, "ever_sold_out": False,
         })
-
         was_sold_out = state.get("ever_sold_out", False) or state.get("last_seen_seats", 1) == 0
         is_return    = was_sold_out and avail > 0
-
-        if avail == 0:
-            state["ever_sold_out"] = True
+        if avail == 0: state["ever_sold_out"] = True
         state["last_seen_seats"] = avail
-        if total > 0:
-            state["capacity"] = total
-
+        if total > 0: state["capacity"] = total
         if avail < MIN_SEATS:
             log(f"  Skip — only {avail} seat(s): {show['title']}")
-            SHOWTIME_STATE[sid] = state
-            save_state()
-            continue
-
+            SHOWTIME_STATE[sid] = state; save_state(); continue
         if state["alerted"] and not is_return:
             log(f"  Skip — already alerted: {show['title']}")
-            SHOWTIME_STATE[sid] = state
-            save_state()
-            continue
-
+            SHOWTIME_STATE[sid] = state; save_state(); continue
         if is_return:
             log(f"  Return after sellout: {show['title']}")
             state["alerted"] = False
-
         log(f"  Checking seat map: {show['title']}")
         good, seat_info, detected_cap = check_sweet_spot(show["purchase_url"])
         cap = state["capacity"] or detected_cap or total
-
         if good:
             sent = send_alert(
-                title=show["title"],
-                showtime_str=show["showtime"],
-                seat_info=seat_info,
-                purchase_url=show["purchase_url"],
-                seats_avail=avail,
-                total_seats=cap,
-                first_seen_seats=state["first_seen_seats"],
-                is_return=is_return,
+                title=show["title"], showtime_str=show["showtime"],
+                seat_info=seat_info, purchase_url=show["purchase_url"],
+                seats_avail=avail, total_seats=cap,
+                first_seen_seats=state["first_seen_seats"], is_return=is_return,
             )
-            if sent:
-                state["alerted"] = True
+            if sent: state["alerted"] = True
         else:
             log(f"  No sweet spot seats: {show['title']}")
-
-        SHOWTIME_STATE[sid] = state
-        save_state()
+        SHOWTIME_STATE[sid] = state; save_state()
 
 def main():
     once = "--once" in sys.argv
     log("🎬 IMAX 70MM Seat Watcher started")
-    log(f"   Mode:      {'single scan' if once else 'continuous'}")
-    log(f"   Watching:  {', '.join(WATCHLIST[:4])}...")
-    log(f"   Alerting:  {ALERT_EMAIL}")
+    log(f"   Mode:     {'single scan' if once else 'continuous'}")
+    log(f"   Watching: {', '.join(WATCHLIST[:4])}...")
+    log(f"   Alerting: {ALERT_EMAIL}")
     load_state()
-
     if once:
         scan()
     else:
@@ -389,8 +375,7 @@ def main():
                 scan()
             except Exception as e:
                 log(f"Scan error: {e}")
-                import traceback
-                traceback.print_exc()
+                import traceback; traceback.print_exc()
             log(f"Next scan in {SCAN_INTERVAL // 60} min...")
             time.sleep(SCAN_INTERVAL)
 
