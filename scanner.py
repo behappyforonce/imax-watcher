@@ -14,7 +14,6 @@ GMAIL_APP_PASS = os.environ.get("GMAIL_APP_PASS")
 ALERT_EMAIL    = os.environ.get("ALERT_EMAIL")
 SCAN_INTERVAL  = int(os.environ.get("SCAN_INTERVAL", "900"))
 MIN_SEATS      = int(os.environ.get("MIN_SEATS", "2"))
-TM_API_KEY     = os.environ.get("TM_API_KEY")
 
 WATCHLIST = [
     "project hail mary",
@@ -31,6 +30,9 @@ WATCHLIST = [
 FORMAT_KEYWORDS = ["imax", "70mm", "plf", "prime", "laser", "large format"]
 SWEET_ROWS      = {"F","G","H","I","J","K","L"}
 SHOWTIME_STATE  = {}
+
+# AMC Lincoln Square 13 — theatre ID 1076
+THEATRE_ID = "1076"
 
 def log(msg):
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}", flush=True)
@@ -51,69 +53,160 @@ def load_state():
     except:
         log("No previous state — starting fresh")
 
-def get_imax_showtimes():
+def try_amc_mobile_api():
+    """AMC's mobile app API — different endpoint, different headers, less bot protection."""
     results = []
-    log(f"  TM_API_KEY present: {bool(TM_API_KEY)}")
+    today   = datetime.now().strftime("%Y-%m-%d")
 
-    if not TM_API_KEY:
-        log("  ERROR: TM_API_KEY not set in Railway Variables!")
-        return results
+    # Try multiple AMC API endpoints used by their iOS/Android app
+    endpoints = [
+        f"https://api.amctheatres.com/v2/theatres/{THEATRE_ID}/showtimes/{today}",
+        f"https://api.amctheatres.com/v2/theatres/{THEATRE_ID}/showtimes",
+        f"https://www.amctheatres.com/api/v2/theatres/{THEATRE_ID}/showtimes/{today}",
+    ]
 
-    # Search by keyword for each watchlist film at Lincoln Square NY
-    for film in ["project hail mary", "sinners", "f1"]:
-        try:
-            url    = "https://app.ticketmaster.com/discovery/v2/events.json"
-            params = {
-                "apikey":   TM_API_KEY,
-                "keyword":  film,
-                "city":     "New York",
-                "stateCode": "NY",
-                "size":     20,
-            }
-            log(f"  Searching TM for: '{film}'")
-            resp = requests.get(url, params=params, timeout=15)
-            log(f"  HTTP {resp.status_code}")
+    headers_variants = [
+        # Mobile app headers
+        {
+            "User-Agent": "AMC/5.x (iPhone; iOS 17.0; Scale/3.0)",
+            "Accept": "application/json",
+            "Accept-Language": "en-US",
+            "X-AMC-Vendor-Key": "amc",
+        },
+        # Android app headers
+        {
+            "User-Agent": "AMC Theatres/5.x (Android 14; Build/UQ1A)",
+            "Accept": "application/json",
+            "Accept-Language": "en-US",
+        },
+        # Generic JSON headers
+        {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
+            "Accept": "application/json, text/plain, */*",
+            "Referer": "https://www.amctheatres.com/",
+        },
+    ]
 
-            if resp.status_code != 200:
-                log(f"  TM error body: {resp.text[:300]}")
-                continue
+    for url in endpoints:
+        for headers in headers_variants:
+            try:
+                log(f"  Trying: {url}")
+                resp = requests.get(url, headers=headers, timeout=15)
+                log(f"  HTTP {resp.status_code} — {len(resp.content)} bytes — Content-Type: {resp.headers.get('Content-Type','?')[:40]}")
 
-            data   = resp.json()
-            total  = data.get("page", {}).get("totalElements", 0)
-            events = data.get("_embedded", {}).get("events", [])
-            log(f"  '{film}': {total} total results, {len(events)} returned")
+                if resp.status_code == 200 and "json" in resp.headers.get("Content-Type", ""):
+                    data = resp.json()
+                    log(f"  JSON keys: {list(data.keys())[:10]}")
 
-            for event in events:
-                name  = event.get("name", "")
-                venue = event.get("_embedded", {}).get("venues", [{}])[0]
-                vname = venue.get("name", "")
-                log(f"    EVENT: '{name}' at '{vname}'")
+                    # Extract showtimes from whatever structure this returns
+                    showtimes = (
+                        data.get("showtimes") or
+                        data.get("data") or
+                        data.get("_embedded", {}).get("showtimes", []) or
+                        []
+                    )
+                    log(f"  Found {len(showtimes)} showtimes")
 
-                # Must be at Lincoln Square
-                if "lincoln square" not in vname.lower():
-                    continue
+                    for st in showtimes:
+                        title     = st.get("movieName") or st.get("title") or st.get("name") or ""
+                        title_low = title.lower()
+                        fmt       = str(st.get("attributes") or st.get("format") or st.get("attributeIds") or "").lower()
+                        desc      = str(st.get("description") or "").lower()
+                        combined  = title_low + " " + fmt + " " + desc
 
-                info     = event.get("info", "").lower()
-                note     = event.get("pleaseNote", "").lower()
-                combined = name.lower() + " " + info + " " + note
-                is_large = any(k in combined for k in FORMAT_KEYWORDS)
-                log(f"    → Lincoln Square match! large_format={is_large}")
+                        is_watchlist = any(w in title_low for w in WATCHLIST)
+                        is_large     = any(k in combined for k in FORMAT_KEYWORDS)
+                        log(f"    '{title}' fmt='{fmt[:40]}' watchlist={is_watchlist} large={is_large}")
 
-                results.append({
-                    "title":        name,
-                    "showtime":     event.get("dates", {}).get("start", {}).get("dateTime", ""),
-                    "showtime_id":  event.get("id", ""),
-                    "seats_avail":  99,
-                    "total_seats":  0,
-                    "purchase_url": event.get("url", ""),
-                })
+                        if is_watchlist and is_large:
+                            sid = str(st.get("id") or st.get("showtimeId") or "")
+                            results.append({
+                                "title":        title,
+                                "showtime":     st.get("showDateTimeLocal") or st.get("startTime") or "",
+                                "showtime_id":  sid,
+                                "seats_avail":  st.get("seatsAvailable") or st.get("availableSeats") or 99,
+                                "total_seats":  st.get("totalSeats") or 0,
+                                "purchase_url": f"https://www.amctheatres.com{st.get('purchaseUrl','') or st.get('url','')}",
+                            })
 
-        except Exception as e:
-            log(f"  TM search error for '{film}': {e}")
+                    if results:
+                        return results
+                    if showtimes:
+                        # Got data but no matches — no point trying other header variants
+                        break
+
+                elif resp.status_code == 200:
+                    snippet = resp.text[:200]
+                    log(f"  Non-JSON response snippet: {snippet}")
+
+            except Exception as e:
+                log(f"  Request error: {e}")
 
     return results
 
-def send_alert(title, showtime_str, purchase_url, is_return):
+def try_fandango():
+    """Fandango has AMC Lincoln Square and a more accessible API."""
+    results = []
+    try:
+        # Fandango theater page for AMC Lincoln Square
+        url     = "https://www.fandango.com/amc-lincoln-square-13_aaanf/theater-page"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml",
+        }
+        log(f"  Trying Fandango: {url}")
+        resp = requests.get(url, headers=headers, timeout=15)
+        log(f"  Fandango HTTP {resp.status_code} — {len(resp.content)} bytes")
+
+        if resp.status_code == 200:
+            from bs4 import BeautifulSoup
+            soup  = BeautifulSoup(resp.text, "html.parser")
+            
+            # Log all movie titles found
+            for el in soup.find_all(attrs={"data-movie-title": True}):
+                log(f"  Fandango movie: '{el['data-movie-title']}'")
+
+            movies = soup.find_all(class_=lambda c: c and "fdng-movie" in str(c).lower())
+            log(f"  Fandango movie sections: {len(movies)}")
+
+            for movie in movies:
+                title_el = movie.find(attrs={"data-movie-title": True}) or movie.find(["h2","h3","h4"])
+                if not title_el: continue
+                title     = title_el.get("data-movie-title") or title_el.get_text(strip=True)
+                title_low = title.lower()
+                log(f"  Fandango section: '{title}'")
+
+                if not any(w in title_low for w in WATCHLIST): continue
+
+                for st in movie.find_all(class_=lambda c: c and "showtime" in str(c).lower()):
+                    full = st.get_text(separator=" ").lower()
+                    if not any(k in full for k in FORMAT_KEYWORDS): continue
+                    link = st.find("a", href=True)
+                    results.append({
+                        "title":        title,
+                        "showtime":     "",
+                        "showtime_id":  link["href"] if link else title,
+                        "seats_avail":  99,
+                        "total_seats":  0,
+                        "purchase_url": f"https://www.fandango.com{link['href']}" if link else "https://www.fandango.com/amc-lincoln-square-13_aaanf/theater-page",
+                    })
+                    log(f"  ✓ Fandango match: '{title}'")
+
+    except Exception as e:
+        log(f"  Fandango error: {e}")
+    return results
+
+def get_imax_showtimes():
+    log("  --- Trying AMC mobile API ---")
+    results = try_amc_mobile_api()
+    if results:
+        return results
+
+    log("  --- Trying Fandango ---")
+    results = try_fandango()
+    return results
+
+def send_alert(title, showtime_str, purchase_url):
     try:
         msg            = MIMEMultipart("alternative")
         msg["Subject"] = f"🎬 IMAX 70MM — {title.upper()}"
@@ -124,16 +217,9 @@ def send_alert(title, showtime_str, purchase_url, is_return):
             dt           = datetime.fromisoformat(showtime_str.replace("Z",""))
             show_display = dt.strftime("%A %b %-d · %-I:%M %p")
         except:
-            show_display = showtime_str or "See link for times"
+            show_display = showtime_str or "See link for showtime"
 
-        text = f"""
-IMAX 70MM SEATS — {title.upper()}
-{"─"*42}
-{show_display} · AMC Lincoln Square 13
-Sweet spot seats available (rows F–L)
-→ BOOK: {purchase_url}
-{"─"*42}
-        """.strip()
+        text = f"IMAX 70MM — {title.upper()}\n{show_display} · AMC Lincoln Square 13\nBOOK: {purchase_url}"
 
         html = f"""
 <html><body style="font-family:monospace;background:#0a0a08;color:#e8e0cc;padding:32px;max-width:500px;margin:0 auto;">
@@ -145,7 +231,7 @@ Sweet spot seats available (rows F–L)
   <div style="background:rgba(232,197,71,.06);border:1px solid rgba(232,197,71,.18);padding:16px;margin-bottom:20px;">
     <div style="font-size:13px;color:#e8c547;">Sweet spot seats available · Rows F–L · 2 adjacent</div>
   </div>
-  <a href="{purchase_url}" style="display:block;background:#e8c547;color:#0a0a08;text-align:center;padding:14px;font-size:11px;font-weight:900;letter-spacing:.3em;text-decoration:none;margin-bottom:20px;">BOOK NOW →</a>
+  <a href="{purchase_url}" style="display:block;background:#e8c547;color:#0a0a08;text-align:center;padding:14px;font-size:11px;font-weight:900;letter-spacing:.3em;text-decoration:none;">BOOK NOW →</a>
 </body></html>"""
 
         msg.attach(MIMEText(text, "plain"))
@@ -160,41 +246,30 @@ Sweet spot seats available (rows F–L)
         return False
 
 def scan():
-    log("─── Scanning Ticketmaster for IMAX 70MM at Lincoln Square...")
+    log("─── Scanning for IMAX 70MM at Lincoln Square...")
     showtimes = get_imax_showtimes()
     if not showtimes:
         log("No matching showtimes found.")
         return
-    log(f"Found {len(showtimes)} showtime(s) to evaluate.")
-
+    log(f"Found {len(showtimes)} showtime(s) to alert on.")
     for show in showtimes:
         sid   = show["showtime_id"]
         state = SHOWTIME_STATE.get(sid, {"alerted": False})
-
         if state["alerted"]:
             log(f"  Skip — already alerted: {show['title']}")
             continue
-
-        sent = send_alert(
-            title=show["title"],
-            showtime_str=show["showtime"],
-            purchase_url=show["purchase_url"],
-            is_return=False,
-        )
+        sent = send_alert(show["title"], show["showtime"], show["purchase_url"])
         if sent:
             state["alerted"] = True
-
         SHOWTIME_STATE[sid] = state
         save_state()
 
 def main():
     log("🎬 IMAX 70MM Seat Watcher started")
-    log(f"   Python: {sys.version}")
+    log(f"   Python: {sys.version.split()[0]}")
     log(f"   Watching:  {', '.join(WATCHLIST[:4])}...")
-    log(f"   Theater:   AMC Lincoln Square 13")
     log(f"   Interval:  every {SCAN_INTERVAL // 60} min")
     log(f"   Alerting:  {ALERT_EMAIL}")
-    log(f"   TM Key:    {'SET ✓' if TM_API_KEY else 'MISSING ✗'}")
     load_state()
     while True:
         try:
