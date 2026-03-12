@@ -87,7 +87,9 @@ def get_imax_showtimes():
             # Navigate to Lincoln Square showtimes page
             url = "https://www.amctheatres.com/theatres/new-york/amc-lincoln-square-13/showtimes/all-movies/today/all-screenings"
             log(f"  Navigating to AMC Lincoln Square...")
-            page.goto(url, wait_until="networkidle", timeout=30000)
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            # Wait a bit for JS to populate showtime data
+            page.wait_for_timeout(5000)
             log("  Page loaded")
 
             # If we intercepted API data, use it
