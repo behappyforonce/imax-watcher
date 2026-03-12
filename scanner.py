@@ -111,11 +111,12 @@ def get_imax_showtimes():
             # Wait for movie content to load
             log("  Waiting for showtime content...")
             try:
-                page.wait_for_selector("[class*='MovieTitle'], [class*='movie-title'], h2, h3", timeout=15000)
-                log("  Content loaded")
+                # Wait for actual showtime content — AMC renders movie titles in these elements
+                page.wait_for_selector("[class*='ShowtimesByMovie'], [class*='showtimes-by-movie'], [class*='MovieTitle'], [data-testid*='movie']", timeout=20000)
+                log("  Showtime content detected")
             except:
-                log("  Selector timeout — waiting 8s for JS...")
-                page.wait_for_timeout(8000)
+                log("  Waiting 15s for JS to render showtimes...")
+                page.wait_for_timeout(15000)
 
             # Take stock of what's on the page
             page_text = page.inner_text("body")
