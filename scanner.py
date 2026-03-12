@@ -92,70 +92,92 @@ def get_imax_showtimes():
             # Wait a moment for cookie popup to appear
             page.wait_for_timeout(2000)
 
-            # Try every possible cookie dismiss approach
+            # Log all buttons visible on page for debugging
+            try:
+                buttons = page.evaluate("""
+                    () => Array.from(document.querySelectorAll('button')).map(b => ({
+                        text: b.innerText.trim().slice(0, 60),
+                        cls: b.className.slice(0, 80)
+                    }))
+                """)
+                log(f"  Buttons on page: {buttons[:15]}")
+            except:
+                pass
+
+            # Try to click Accept All / Save Preferences explicitly
             dismissed = False
 
-            # 1. Try Osano-specific buttons (AMC uses Osano)
-            for selector in [
-                ".osano-cm-button--type_accept",
-                ".osano-cm-accept",
-                ".osano-cm-button[data-onetrust-accept-btn-handler]",
-                "button.osano-cm-button",
-            ]:
-                try:
-                    btn = page.locator(selector).first
-                    if btn.is_visible(timeout=1500):
-                        btn.click()
-                        log(f"  Dismissed Osano popup: {selector}")
-                        dismissed = True
-                        break
-                except:
-                    pass
+            # 1. JS: find button whose text contains "accept all" or "allow all"
+            try:
+                result = page.evaluate("""
+                    () => {
+                        const buttons = Array.from(document.querySelectorAll('button'));
+                        const targets = ['accept all', 'allow all', 'accept cookies', 'agree to all'];
+                        for (const btn of buttons) {
+                            const t = btn.innerText.toLowerCase().trim();
+                            if (targets.some(x => t.includes(x))) {
+                                btn.click();
+                                return btn.innerText.trim();
+                            }
+                        }
+                        return null;
+                    }
+                """)
+                if result:
+                    log(f"  Clicked: '{result}'")
+                    dismissed = True
+            except:
+                pass
 
-            # 2. Try text-based button matching
+            # 2. Osano accept-all specific class
             if not dismissed:
-                for text in ["Accept All", "Accept", "I Accept", "Agree", "OK", "Got it", "Allow All", "Allow all cookies"]:
+                for selector in [
+                    ".osano-cm-button--type_accept",
+                    "[class*='accept-all']",
+                    "[class*='acceptAll']",
+                ]:
                     try:
-                        btn = page.get_by_role("button", name=text, exact=False).first
+                        btn = page.locator(selector).first
                         if btn.is_visible(timeout=1000):
                             btn.click()
-                            log(f"  Dismissed popup by text: '{text}'")
+                            log(f"  Dismissed via selector: {selector}")
                             dismissed = True
                             break
                     except:
                         pass
 
-            # 3. Nuclear option — JS click on any consent button
+            # 3. If preferences drawer is open, click Save/Confirm inside it
             if not dismissed:
                 try:
                     result = page.evaluate("""
                         () => {
-                            const selectors = [
-                                '.osano-cm-button--type_accept',
-                                '.osano-cm-accept',
-                                '[class*="accept"]',
-                                '[class*="consent"] button',
-                                '[class*="cookie"] button',
-                                '[id*="accept"]',
-                            ];
-                            for (const sel of selectors) {
-                                const el = document.querySelector(sel);
-                                if (el) { el.click(); return sel; }
+                            const buttons = Array.from(document.querySelectorAll('button'));
+                            const targets = ['save', 'confirm', 'done', 'close'];
+                            for (const btn of buttons) {
+                                const t = btn.innerText.toLowerCase().trim();
+                                if (targets.some(x => t === x)) {
+                                    btn.click();
+                                    return btn.innerText.trim();
+                                }
                             }
                             return null;
                         }
                     """)
                     if result:
-                        log(f"  Dismissed via JS: {result}")
+                        log(f"  Closed preferences drawer: '{result}'")
                         dismissed = True
                 except:
                     pass
 
+            # 4. Press Escape to close any modal
             if not dismissed:
-                log("  No cookie popup found (or already accepted)")
+                page.keyboard.press("Escape")
+                log("  Pressed Escape to close modal")
+
+            log(f"  Cookie dismissed={dismissed}")
 
             # Wait for cookie dismissal to take effect
-            page.wait_for_timeout(2000)
+            page.wait_for_timeout(3000)
 
             # Wait for movie content to load
             log("  Waiting for showtime content...")
