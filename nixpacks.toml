@@ -1,5 +1,5 @@
 [phases.install]
-cmds = ["pip3 install -r requirements.txt"]
+cmds = ["/opt/venv/bin/pip install -r requirements.txt"]
 
 [start]
-cmd = "python3 scanner.py"
+cmd = "/opt/venv/bin/python scanner.py"
