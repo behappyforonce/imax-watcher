@@ -2,6 +2,6 @@
 builder = "NIXPACKS"
 
 [deploy]
-startCommand = "python3 scanner.py"
+startCommand = "/opt/venv/bin/python scanner.py"
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
